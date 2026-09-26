@@ -14,7 +14,12 @@ Forwarding follows classical *longest prefix match* (LPM): the rule with the
 longest matching prefix decides the packet.  Priority only breaks ties between
 rules that carry the *exact same* CIDR.  This means a long-prefix rule wins
 inside its network even when its numeric priority is lower — such a case is
-flagged as a ``priority_inversion`` observation.
+flagged as a ``priority_inversion`` observation, but only when the parent/child
+edge is an *effective* action boundary (see the minimal-pair paragraph below):
+an edge across which no address actually changes action — e.g. a deny /16
+fully covered by permit /17s under a permit /8 — is neither flagged nor
+counted, while longer different-action descendants re-forming the boundary
+through such a shadowed child keep the inversion.
 
 Coverage of a rule R is
 ``cidr(R) minus the union of cidr(D) for every winning rule D in R's subtree``.
@@ -473,8 +478,10 @@ def analyze_rules(raw_rules: Any) -> dict[str, Any]:
                     "parent_action": p_rule.action,
                     "action_conflict": action_conflict,
                     "behavioral": False,  # refined after minimal-pair computation
-                    # An inversion only matters when the longer prefix also
-                    # changes the action; same-action inversions are no-ops.
+                    # A numeric inversion only matters when the longer prefix
+                    # also changes the action; same-action inversions are
+                    # no-ops.  Refined below to *effective* action boundaries
+                    # only: a child that decides no address shows no inversion.
                     "priority_inversion": c_rule.priority > p_rule.priority and action_conflict,
                     "child_effective": [str(n) for n in _sort_networks(child.effective)],
                     "reason": reason,
@@ -560,7 +567,13 @@ def analyze_rules(raw_rules: Any) -> dict[str, Any]:
         cover_pair_edge_index.add((top.winner.rule_id, a_rule.rule_id))
 
     # Refine behavioural flags on direct-edge findings: an edge is behavioural
-    # when it is the action-boundary edge of at least one minimal conflict pair.
+    # when it is the action-boundary edge of at least one minimal conflict
+    # pair.  Priority inversions are gated on the same condition — an
+    # inversion is only real where an action boundary actually takes effect:
+    # a child that decides no address and whose descendants agree with the
+    # parent (a deny /16 fully covered by permit /17s under a permit /8)
+    # shows no inversion, while different-action descendants re-forming the
+    # boundary through the shadowed child (deny /17s) keep it.
     for f in findings:
         if f["type"] != "cover":
             continue
@@ -568,6 +581,7 @@ def analyze_rules(raw_rules: Any) -> dict[str, Any]:
         f["behavioral"] = bool(f["action_conflict"] and is_boundary)
         if f["action_conflict"] and is_boundary:
             f["severity"] = "conflict"
+        f["priority_inversion"] = bool(f["priority_inversion"] and is_boundary)
 
     # Rule ids that participate in any behavioural conflict pair.
     conflicting_rule_ids: set[str] = set()

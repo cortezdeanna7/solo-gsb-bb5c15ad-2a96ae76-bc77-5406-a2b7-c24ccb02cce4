@@ -148,6 +148,78 @@ def test_shadowed_child_same_action_produces_no_conflict_pair(client: TestClient
     assert not any(p["action"] == p["other_action"] for p in data["minimal_conflict_pairs"])
 
 
+def test_priority_inversion_requires_effective_action_boundary(client: TestClient) -> None:
+    # permit /8 (prio 0) -> deny /16 (prio 100), and the /16 is fully covered
+    # by two *permit* /17s: the /16 decides no address and the /17s agree
+    # with the /8, so the /16->/8 edge carries no effective action change.
+    # It must be neither flagged nor counted as a priority inversion.
+    body = {
+        "rules": [
+            {"rule_id": "r1", "cidr": "10.0.0.0/8", "action": "permit", "priority": 0},
+            {"rule_id": "r2", "cidr": "10.1.0.0/16", "action": "deny", "priority": 100},
+            {"rule_id": "r3", "cidr": "10.1.0.0/17", "action": "permit", "priority": 100},
+            {"rule_id": "r4", "cidr": "10.1.128.0/17", "action": "permit", "priority": 100},
+        ]
+    }
+    # Direct (unsaved) analysis.
+    direct = client.post("/api/analyze", json={**body, "save": False}).json()
+    assert direct["persisted"] is False
+    by_edge = {
+        (f["rule_id"], f["other_rule_id"]): f
+        for f in direct["findings"]
+        if f["type"] == "cover"
+    }
+    assert by_edge[("r2", "r1")]["action_conflict"] is True
+    assert by_edge[("r2", "r1")]["behavioral"] is False
+    assert by_edge[("r2", "r1")]["priority_inversion"] is False
+    assert direct["summary"]["priority_inversions"] == 0
+    assert not [f for f in direct["findings"] if f.get("priority_inversion")]
+
+    # Saved analysis: the stored result, its findings rows and the summary
+    # all agree with the direct run.
+    saved = client.post("/api/analyze", json=body).json()
+    aid = saved["id"]
+    assert saved["summary"]["priority_inversions"] == 0
+
+    fetched = client.get(f"/api/analyses/{aid}").json()
+    assert fetched["summary"]["priority_inversions"] == 0
+    assert not [f for f in fetched["findings"] if f.get("priority_inversion")]
+
+    stored = client.get(f"/api/analyses/{aid}/findings").json()
+    assert stored["count"] == len(fetched["findings"])
+    assert not [f for f in stored["findings"] if f["detail"].get("priority_inversion")]
+
+
+def test_priority_inversion_kept_when_descendants_form_boundary(client: TestClient) -> None:
+    # Same shape, but the /16 is fully covered by two *deny* /17s: the /16
+    # itself still decides nothing, yet the longer deny descendants re-form
+    # the effective action boundary across the /16->/8 edge (the minimal
+    # pairs skip the same-action /16 and pair each /17 with the /8), so the
+    # numeric inversion on that edge is kept.
+    body = {
+        "rules": [
+            {"rule_id": "r1", "cidr": "10.0.0.0/8", "action": "permit", "priority": 0},
+            {"rule_id": "r2", "cidr": "10.1.0.0/16", "action": "deny", "priority": 100},
+            {"rule_id": "r3", "cidr": "10.1.0.0/17", "action": "deny", "priority": 100},
+            {"rule_id": "r4", "cidr": "10.1.128.0/17", "action": "deny", "priority": 100},
+        ]
+    }
+    data = client.post("/api/analyze", json=body).json()
+    pairs = {(p["rule_id"], p["other_rule_id"]) for p in data["minimal_conflict_pairs"]}
+    assert pairs == {("r3", "r1"), ("r4", "r1")}
+    by_edge = {
+        (f["rule_id"], f["other_rule_id"]): f
+        for f in data["findings"]
+        if f["type"] == "cover"
+    }
+    assert by_edge[("r2", "r1")]["behavioral"] is True
+    assert by_edge[("r2", "r1")]["priority_inversion"] is True
+    # Same-action inner edges never show an inversion.
+    assert by_edge[("r3", "r2")]["priority_inversion"] is False
+    assert by_edge[("r4", "r2")]["priority_inversion"] is False
+    assert data["summary"]["priority_inversions"] == 1
+
+
 def test_duplicate_cidr_action_conflict_pair(client: TestClient) -> None:
     body = {
         "rules": [
